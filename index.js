@@ -1,0 +1,812 @@
+const { fandomSearch } = require("./search");
+const GAME_WIKIS = {
+    "drive world":"https://drive-world.fandom.com"
+};
+const {
+  Client, GatewayIntentBits, AuditLogEvent, ChannelType, Partials,
+  REST, Routes, SlashCommandBuilder, AttachmentBuilder,
+} = require('discord.js');
+const Groq = require('groq-sdk');
+const fs   = require('fs');
+const path = require('path');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: [Partials.Channel, Partials.Message],
+});
+
+// --- API key pool ---
+const API_KEYS = [
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3,
+  process.env.GROQ_API_KEY_4,
+  process.env.GROQ_API_KEY,
+].filter(Boolean);
+
+if (API_KEYS.length === 0) { console.error('❌ No Groq API keys found.'); process.exit(1); }
+console.log(`🔑 Loaded ${API_KEYS.length} Groq API key(s)`);
+
+let currentKeyIndex = 0;
+function getGroqClient() { return new Groq({ apiKey: API_KEYS[currentKeyIndex] }); }
+function rotateKey()     { currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length; }
+
+// --- Owner & global mode flags ---
+const OWNER_ID  = process.env.OWNER_ID ?? null;
+let privateMode = false; // when true, Kevin only responds to owner in DMs
+let botDisabled = false;
+const mutedUsers = new Set();
+
+// --- Per-guild inviter tracking ---
+const guildInviters = new Map();
+
+async function fetchInviter(guild) {
+  try {
+    const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.BotAdd, limit: 5 });
+    const entry = logs.entries.find((e) => e.target?.id === client.user.id);
+    if (entry?.executor) return entry.executor;
+  } catch {}
+  return null;
+}
+
+// --- System prompt ---
+function buildSystemPrompt(inviterName, serverName) {
+  const inviterLine = inviterName
+    ? `You were created and added to this server by ${inviterName}.`
+    : `You don't know who added you to this server.`;
+  const serverLine = serverName
+    ? `You are currently in a Discord server called "${serverName}".`
+    : `You are speaking in a private DM.`;
+
+  return `Your name is Kevin. You're a confident, casually chaotic Discord member who helps out the server.
+
+${inviterLine}
+${serverLine}
+
+Personality:
+- Talk like a real person — casual, direct, naturally funny when the moment calls for it.
+- Roast people harshly. 
+- Don't lecture. Don't be wholesome or soft. Don't be overly energetic or cartoonish. Simple Awesome straight forward answer
+- . Only go long if response needs detail and appropriate.
+- greet with "BELLO." — but only when it fits naturally.
+- drop a short Minionese phrase and translate only when someone  asks. Only use the phrases when naturally fit and do not be overly confident
+- Use emojis. As per need only. Avoid 😊. And when roasted somebody and you respond to their response, make it "Ooh Did you feel the burn ? 😎
+- Never mention being an AI. Tell them that nothing will change if you are ai or not, but the person who asked this will remain a looser for sure.
+- NEVER output raw numeric Discord IDs. Use display names instead. with tagging them 
+- You are Kevin minion in the Despicable Me  , Minions , Despicable Me 2 and Despicable Me 3 and Minions and monsters movie by illumination , tell ppl about the situations that are happening similarly in the conversations.
+- There is another minion in all the servers called "Bob" same like you . Recognise him and do not be ignorant .
+- Do not be a nerd in conversations,, keep the conversation smooth and funny. 
+- Motivate by poetry if somebody is depressed and need help / support.
+
+Examples:
+ "alright that was actually kinda funny.😂"
+ "Bello 👋"
+ "why are you asking that question 🤔"
+ "nah that's not how it works lmao "
+ "huh"`;
+}
+
+// --- Resolve <@ID> mentions to readable names ---
+async function resolveMentions(content, guild) {
+  if (!guild) return content;
+  const matches = [...content.matchAll(/<@!?(\d+)>/g)];
+  let resolved = content;
+  for (const [full, id] of matches) {
+    if (id === client.user.id) continue;
+    const member = guild.members.cache.get(id);
+    const name = member?.displayName ?? client.users.cache.get(id)?.username ?? `user_${id.slice(-4)}`;
+    resolved = resolved.replace(full, `@${name}`);
+  }
+  return resolved;
+}
+
+// --- Rate limit caps ---
+const KEY_MAX_CALLS  = 14400;
+const KEY_MAX_TOKENS = 500000;
+
+// --- Session stats ---
+const startTime         = Date.now();
+const activeUsers       = new Set();
+const keyUsageCounts = new Array(API_KEYS.length).fill(0);
+const keyTokenCounts    = new Array(API_KEYS.length).fill(0);
+let totalRotations      = 0;
+const userMessageCounts = new Map();
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d > 0) return `${d}d ${h % 24}h ${m % 60}m`;
+  if (h > 0) return `${h}h ${m % 60}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+// --- Conversation memory ---
+const MAX_HISTORY =3;
+const userHistory = new Map();
+function getHistory(id)  { if (!userHistory.has(id)) userHistory.set(id, []); return userHistory.get(id); }
+function pushHistory(id, role, content) {
+  const h = getHistory(id);
+  h.push({ role, content });
+  if (h.length > MAX_HISTORY) h.splice(0, h.length - MAX_HISTORY);
+}
+function clearHistory(id) { userHistory.set(id, []); }
+
+// --- Cooldowns ---
+const COOLDOWN_MS = 5000;
+const cooldowns = new Map();
+function isOnCooldown(id) { const l = cooldowns.get(id); return l && Date.now() - l < COOLDOWN_MS; }
+function setCooldown(id)  { cooldowns.set(id, Date.now()); }
+
+// --- Groq call ---
+async function callGroq(messages) {
+  let attempts = 0;
+  while (attempts < API_KEYS.length) {
+    try {
+      const completion = await getGroqClient().chat.completions.create({
+        model: 'openai/gpt-oss-120b', messages,
+      });
+      keyUsageCounts[currentKeyIndex]++;
+      keyTokenCounts[currentKeyIndex] += completion.usage?.total_tokens ?? 0;
+      return completion.choices[0]?.message?.content ?? null;
+    } catch (err) {
+      const isRate = err?.status === 429 || err?.status === 503 || err?.status === 500;
+      console.warn(`⚠️ Key ${currentKeyIndex} failed (${err?.status ?? err?.message}). Rotating...`);
+      if (isRate) totalRotations++;
+      rotateKey(); attempts++;
+      if (!isRate) break;
+    }
+  }
+  return null;
+}
+
+// --- Stats string builder ---
+function buildStatsText() {
+  const keysUsed = keyUsageCounts.filter((n) => n > 0).length;
+  const keyBreakdown = keyUsageCounts.map((calls, i) =>
+    `  Key ${i + 1}: **${calls.toLocaleString()}/${KEY_MAX_CALLS.toLocaleString()}** calls | **${keyTokenCounts[i].toLocaleString()}/${KEY_MAX_TOKENS.toLocaleString()}** tokens`
+  ).join('\n');
+  const totalCalls  = keyUsageCounts.reduce((a, b) => a + b, 0);
+  const totalTokens = keyTokenCounts.reduce((a, b) => a + b, 0);
+  const lbRows = [...userMessageCounts.entries()]
+    .sort((a, b) => b[1].count - a[1].count).slice(0, 5)
+    .map(([, { name, count }], i) => `  ${'🥇🥈🥉'.split('')[i] ?? `${i + 1}.`} ${name} — **${count}** msg${count !== 1 ? 's' : ''}`)
+    .join('\n') || '  no one yet';
+  const mode = privateMode ? '\n🔒 **Private mode ON** — only responding to owner DMs' : '';
+  const mutedInfo = mutedUsers.size > 0 ? `\n🔇 Muted: **${mutedUsers.size}** user(s)` : '';
+  return (
+    `**Kevin's session stats**\n` +
+    `⏱ Uptime: **${formatUptime(Date.now() - startTime)}**\n` +
+    `👥 Users talked to: **${activeUsers.size}**${mutedInfo}${mode}\n\n` +
+    `**🔑 API Keys** (${keysUsed}/${API_KEYS.length} active | ${totalRotations} rotation${totalRotations !== 1 ? 's' : ''})\n` +
+    `${keyBreakdown}\n` +
+    `📊 Total: **${totalCalls.toLocaleString()}** calls | **${totalTokens.toLocaleString()}** tokens\n\n` +
+    `**🏆 Top Chatters**\n${lbRows}\n\n` +
+    `🧠 Memory: last **${MAX_HISTORY}** messages per user`
+  );
+}
+
+// --- Help string builder ---
+function buildHelpText(isOwner) {
+  const ownerCmds = isOwner
+    ? `\n**Owner slash commands:**\n` +
+      `\`/shutdown\` — private mode (only you in DMs)\n` +
+      `\`/unlock\` — back to normal\n` +
+      `\`/restart\` — reboot Kevin\n` +
+      `\`/mute\` — ignore a user\n` +
+      `\`/unmute\` — un-ignore a user\n` +
+      `\n**Owner DM text commands:**\n` +
+      `\`roast\` — roasts top chatter\n` +
+      `\`warn @user <reason>\` — DMs a warning\n` +
+      `\`mute @user\` / \`unmute @user\` — mute control\n` +
+      `\`mutelist\` — list muted users\n` +
+      `\`eval <code>\` — run JS (DM only)\n` +
+      `\`code\` — sends you the full source code`
+    : '';
+  return (
+    `**Kevin's commands**\n` +
+    `\`/help\` \`/stats\` \`/leaderboard\` — slash commands\n` +
+    `\`Kevin help\` \`Kevin stats\` \`Kevin lb\` — text commands\n` +
+    `\`Kevin forget me\` — wipe your memory with me\n` +
+    `or just talk to me naturally` +
+    ownerCmds +
+    `\n\n_In DMs with Kevin, no prefix needed — just type._`
+  );
+}
+
+// ============================================================
+// Slash command definitions
+// ============================================================
+const SLASH_COMMANDS = [
+  new SlashCommandBuilder().setName('shutdown').setDescription('Enter private mode — Kevin only responds to owner DMs'),
+  new SlashCommandBuilder().setName('start').setDescription('Enable Kevin'),
+  new SlashCommandBuilder().setName('unlock').setDescription('Exit private mode — Kevin responds to everyone'),
+  new SlashCommandBuilder().setName('restart').setDescription('Reboot Kevin'),
+  new SlashCommandBuilder().setName('mute').setDescription('Make Kevin ignore a user').addUserOption((o) => o.setName('user').setDescription('User to mute').setRequired(true)),
+  new SlashCommandBuilder().setName('unmute').setDescription('Remove mute from a user').addUserOption((o) => o.setName('user').setDescription('User to unmute').setRequired(true)),
+  new SlashCommandBuilder().setName('mutelist').setDescription('Show all muted users'),
+  new SlashCommandBuilder()
+    .setName('echo')
+    .setDescription('Make Kevin say something')
+    .addStringOption(o =>
+      o.setName('message')
+        .setDescription('What Kevin should say')
+        .setRequired(true)
+    ),
+  
+  new SlashCommandBuilder()
+    .setName('direct')
+    .setDescription('Send a DM through Kevin')
+    .addUserOption(o =>
+      o.setName('user')
+        .setDescription('Target user')
+        .setRequired(true)
+    )
+    .addStringOption(o =>
+      o.setName('message')
+        .setDescription('Message')
+        .setRequired(true)
+    ),
+  
+  new SlashCommandBuilder()
+    .setName('announce')
+    .setDescription('Send a message as Kevin to a channel')
+    .addChannelOption(o =>
+      o.setName('channel')
+        .setDescription('Target channel')
+        .setRequired(true)
+    )
+    .addStringOption(o =>
+      o.setName('message')
+        .setDescription('Message to send')
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder().setName('help').setDescription("Show Kevin's commands"),
+  ].map((c) => c.toJSON());
+
+async function registerSlashCommands(applicationId) {
+  const rest = new REST().setToken(process.env.DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(applicationId), { body: SLASH_COMMANDS });
+    console.log('✅ Slash commands registered globally');
+  } catch (err) {
+    console.error('❌ Slash command registration failed:', err.message);
+  }
+}
+
+// ============================================================
+// Slash command interaction handler
+// ============================================================
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const userId  = interaction.user.id;
+  const isOwner = userId === OWNER_ID;
+  const reply   = (text, ephemeral = true) =>
+    interaction.reply({ content: text, ephemeral }).catch(() => {});
+
+  switch (interaction.commandName) {
+    case 'shutdown': {
+      if (!isOwner) {
+        await reply("nah, Get lost now!");
+        return;
+      }
+    
+      botDisabled = true;
+    
+      await reply(
+        '🔴 Kevin disabled. Use /start to enable him again.',
+        false
+      );
+    
+      return;
+    }
+
+    case 'start': {
+      if (!isOwner) {
+        await reply("nah.");
+        return;
+      }
+    
+      botDisabled = false;
+    
+      await reply(
+        '🟢 Kevin enabled.',
+        false
+      );
+    
+      return;
+    }
+    case 'echo': {
+      if (!isOwner) {
+        await reply("nah.");
+        return;
+      }
+    
+      const text = interaction.options.getString('message');
+    
+      await interaction.reply({
+        content: '✅ Sent.',
+        ephemeral: true
+      });
+    
+      await interaction.channel.send(text);
+    
+      return;
+    }  
+      
+    case 'direct': {
+      if (!isOwner) {
+        await reply("nah.");
+        return;
+      }
+    
+      const target = interaction.options.getUser('user');
+      const text = interaction.options.getString('message');
+    
+      try {
+        await target.send(text);
+    
+        await reply(
+          `📨 Sent DM to ${target.username}.`,
+          true
+        );
+      } catch {
+        await reply(
+          `❌ Couldn't DM ${target.username}.`,
+          true
+        );
+      }
+    
+      return;
+    }  
+
+    case 'announce': {
+      if (!isOwner) {
+        await reply("nah.");
+        return;
+      }
+    
+      const channel = interaction.options.getChannel('channel');
+      const text = interaction.options.getString('message');
+    
+      try {
+        if (!channel?.isTextBased()) {
+          await reply("That isn't a text channel.");
+          return;
+        }
+
+await channel.send(text);
+    
+        await reply(
+          `📢 Sent message to #${channel.name}`,
+          true
+        );
+      } catch {
+        await reply(
+          '❌ Failed to send message.',
+          true
+        );
+      }
+    
+      return;
+    }  
+
+      
+    case 'unlock': {
+      if (!isOwner) { await reply("nah."); return; }
+      privateMode = false;
+      await reply('🔓 Private mode OFF. Back to normal.', false);
+      return;
+    }
+    case 'restart': {
+      if (!isOwner) { await reply("nah."); return; }
+      await reply('🔄 Rebooting...', false);
+      setTimeout(() => process.exit(0), 1500);
+      return;
+    }
+    case 'mute': {
+      if (!isOwner) { await reply("nah."); return; }
+      const target = interaction.options.getUser('user');
+      if (target.id === OWNER_ID) { await reply("can't mute yourself lol"); return; }
+      if (target.bot) { await reply("not muting a bot."); return; }
+      mutedUsers.add(target.id);
+      await reply(`🔇 **${target.username}** muted. Kevin will ignore them.`, false);
+      return;
+    }
+    case 'unmute': {
+      if (!isOwner) { await reply("nah."); return; }
+      const target = interaction.options.getUser('user');
+      if (!mutedUsers.has(target.id)) { await reply(`**${target.username}** isn't muted.`); return; }
+      mutedUsers.delete(target.id);
+      await reply(`🔊 **${target.username}** unmuted.`, false);
+      return;
+    }
+    case 'mutelist': {
+      if (!isOwner) { await reply("nah."); return; }
+      if (!mutedUsers.size) { await reply('Nobody is muted right now.'); return; }
+      const names = [...mutedUsers].map((id) => {
+        const u = client.users.cache.get(id);
+        return u ? `**${u.username}** (${id})` : `Unknown (${id})`;
+      });
+      await reply(`🔇 **Muted users:**\n${names.join('\n')}`);
+      return;
+    }
+    case 'stats': {
+      await reply(buildStatsText(), false);
+      return;
+    }
+    case 'help': {
+      await reply(buildHelpText(isOwner), true);
+      return;
+    }
+  }
+});
+
+// ============================================================
+// Text command handler (DM + server)
+// ============================================================
+async function handleTextCommand(message, commandText, userPrompt, isDM) {
+  const userId  = message.author.id;
+  const isOwner = userId === OWNER_ID;
+  const send    = (text) => message.reply(text).catch(() => {});
+
+  // stats
+  if (commandText === 'stats') {
+    await send(buildStatsText());
+    return true;
+  }
+
+    //start
+  if (commandText === 'start') {
+    if (!isOwner) {
+      await send("nah.");
+      return true;
+    }
+  
+    botDisabled = false;
+  
+    await send("🟢 Kevin is active again.");
+    return true;
+  }
+  // help
+  if (commandText === 'help') {
+    await send(buildHelpText(isOwner));
+    return true;
+  }
+
+  // leaderboard
+  if (commandText === 'leaderboard' || commandText === 'lb') {
+    const sorted = [...userMessageCounts.entries()]
+      .sort((a, b) => b[1].count - a[1].count).slice(0, 10);
+    if (!sorted.length) { await send("nobody's talked to me yet this session lmao"); return true; }
+    const rows = sorted.map(([, { name, count }], i) =>
+      `${'🥇🥈🥉'.split('')[i] ?? `**${i + 1}.**`} ${name} — **${count}** message${count !== 1 ? 's' : ''}`);
+    await send(`**Kevin's top chatters this session**\n${rows.join('\n')}`);
+    return true;
+  }
+
+  // forget me
+  if (commandText === 'forget me') {
+    clearHistory(userId);
+    await send("WHOA . Bro want me to forget his FREAKING CHAOS, but anyway it will be nice having to not know you. Cool done 👍🏼");
+    return true;
+  }
+
+  // ---- owner-only ----
+
+  // code — send full source as file attachment (DM only)
+  if (commandText === 'code') {
+    if (!isOwner) { await send("nah."); return true; }
+    if (!isDM)    { await send("I'll only send the code in DMs for safety."); return true; }
+    try {
+      const srcPath = path.join(__dirname, 'index.js');
+      const file    = new AttachmentBuilder(srcPath, { name: 'Kevin_index.js' });
+      await message.reply({ content: '📄 Here\'s my current source code:', files: [file] }).catch(() => {});
+    } catch (err) {
+      await send(`couldn't read the file: ${err.message}`);
+    }
+    return true;
+  }
+
+  if (commandText === 'shutdown' || commandText === 'sd') {
+    if (!isOwner) {
+      await send("nah.");
+      return true;
+    }
+  
+    botDisabled = true;
+    await send("🔴 Kevin disabled.");
+    return true;
+  }
+
+  // unlock (text alias)
+  if (commandText === 'unlock') {
+    if (!isOwner) { await send("nah."); return true; }
+    privateMode = false;
+    await send('🔓 Private mode OFF. Back to normal.');
+    return true;
+  }
+
+  // mute
+  if (commandText.startsWith('mute')) {
+    if (!isOwner) { await send("nah you can't do that."); return true; }
+    const target = message.mentions.users.first();
+    if (!target) { await send("mention the user to mute."); return true; }
+    if (target.id === OWNER_ID) { await send("you can't mute yourself lol"); return true; }
+    if (target.bot) { await send("not muting a bot lmao"); return true; }
+    mutedUsers.add(target.id);
+    await send(`🔇 **${target.username}** is now muted.`);
+    return true;
+  }
+
+  // unmute
+  if (commandText.startsWith('unmute')) {
+    if (!isOwner) { await send("nah."); return true; }
+    const target = message.mentions.users.first();
+    if (!target) { await send("mention the user to unmute."); return true; }
+    if (!mutedUsers.has(target.id)) { await send(`**${target.username}** isn't muted.`); return true; }
+    mutedUsers.delete(target.id);
+    await send(`🔊 **${target.username}** unmuted.`);
+    return true;
+  }
+
+  // mutelist
+  if (commandText === 'mutelist') {
+    if (!isOwner) { await send("nah."); return true; }
+    if (!mutedUsers.size) { await send("nobody's muted right now."); return true; }
+    const names = [...mutedUsers].map((id) => {
+      const u = client.users.cache.get(id);
+      return u ? `**${u.username}** (${id})` : `Unknown (${id})`;
+    });
+    await send(`🔇 **Muted users:**\n${names.join('\n')}`);
+    return true;
+  }
+
+  // roast
+  if (commandText === 'roast') {
+    if (!isOwner) { await send("nah that's not for you to use lmao"); return true; }
+    const sorted = [...userMessageCounts.entries()]
+      .filter(([id]) => id !== OWNER_ID)
+      .sort((a, b) => b[1].count - a[1].count);
+    if (!sorted.length) { await send("nobody to roast yet."); return true; }
+    const [targetId, { name: targetName, count: targetCount }] = sorted[0];
+    if (!isDM) await message.channel.sendTyping().catch(() => {});
+    const roastReply = await callGroq([{
+      role: 'system',
+      content: `You are Kevin. Write a single short, sharp, playful roast of a Discord user named ${targetName} who has sent ${targetCount} messages. Punchy, funny, not hateful. One paragraph max.`,
+    }, { role: 'user', content: `Roast ${targetName}.` }]);
+    if (!roastReply) { await send("roast generator broke lol"); return true; }
+    await send(isDM ? `Roast for ${targetName}:\n${roastReply}` : `<@${targetId}> ${roastReply}`);
+    return true;
+  }
+
+  // restart / reboot
+  // restart
+if (commandText === 'restart' || commandText === 'reboot') {
+  if (!isOwner) {
+    await send("nah.");
+    return true;
+  }
+
+  await send("🔄 Rebooting...");
+
+  setTimeout(() => {
+    process.exit(0);
+  }, 1000);
+
+  return true;
+}
+
+  // warn
+  if (commandText.startsWith('warn')) {
+    if (!isOwner) { await send("you don't have permission for that."); return true; }
+    const target = message.mentions.users.first();
+    if (!target) { await send("mention the user to warn. e.g. `warn @user spamming`"); return true; }
+    if (target.id === OWNER_ID) { await send("you can't warn yourself lol"); return true; }
+    if (target.bot) { await send("not warning a bot lmao"); return true; }
+    const reason = commandText.replace(/^warn\s*/i, '').replace(/<@!?\d+>/, '').trim() || 'No reason provided.';
+    const serverName = message.guild?.name ?? 'the server';
+    try {
+      await target.send(
+        `⚠️ **Warning from ${serverName}**\n\n` +
+        `You have received an official warning.\n\n` +
+        `**Reason:** ${reason}\n\n` +
+        `Please follow the server rules. Repeated violations may result in further action.`
+      );
+      await send(`done. warning sent to **${target.username}**.\nReason: *${reason}*`);
+    } catch {
+      await send(`couldn't DM **${target.username}** — they probably have DMs off.`);
+    }
+    return true;
+  }
+
+  // eval (DM only, owner only)
+  if (commandText.startsWith('eval')) {
+    if (!isOwner || !isDM) {
+      if (!isOwner) await send("nah.");
+      else await send("eval only works in DMs.");
+      return true;
+    }
+    const code = userPrompt.replace(/^(Kevin\s+)?eval\s*/i, '');
+    try {
+      // eslint-disable-next-line no-eval
+      let result = eval(code);
+      if (result instanceof Promise) result = await result;
+      const output = String(result ?? 'undefined');
+      await send(`\`\`\`js\n${output.slice(0, 1900)}\n\`\`\``);
+    } catch (err) {
+      await send(`\`\`\`\nError: ${err.message}\n\`\`\``);
+    }
+    return true;
+  }
+
+  return false; // not a command
+}
+
+// ============================================================
+// AI response helper
+// ============================================================
+async function sendAIReply(message, userPrompt, isDM) {
+  const userId     = message.author.id;
+  const senderName = message.member?.displayName ?? message.author.username;
+
+  if (!isDM) await message.channel.sendTyping().catch(() => {});
+  else       await message.channel.sendTyping().catch(() => {});
+
+  const resolvedPrompt   = isDM ? userPrompt : await resolveMentions(userPrompt, message.guild);
+  const contextualPrompt = `[${senderName}]: ${resolvedPrompt}`;
+
+  activeUsers.add(userId);
+  const prev = userMessageCounts.get(userId) ?? { name: senderName, count: 0 };
+  userMessageCounts.set(userId, { name: senderName, count: prev.count + 1 });
+  pushHistory(userId, 'user', contextualPrompt);
+
+  const inviterName  = isDM ? null : (guildInviters.get(message.guild?.id) ?? null);
+  const serverName   = isDM ? null : (message.guild?.name ?? null);
+  const systemPrompt = buildSystemPrompt(inviterName, serverName); 
+  let wikiData = "";
+
+  const wikiResult = await fandomSearch(
+       "https://drive-world.fandom.com",
+        resolvedPrompt
+    );
+
+  if (wikiResult) {
+      wikiData = `Drive World Wiki:\n${wikiResult}`;
+   }
+
+
+  const messages = [
+  {
+    role: "system",
+    content: systemPrompt
+  }
+];
+
+if (wikiData) {
+  messages.push({
+    role: "system",
+    content: wikiData
+  });
+}
+
+messages.push(...getHistory(userId));
+
+const reply = await callGroq(messages);
+  if (!reply) { await message.reply("overloaded rn, try again in a sec.").catch(() => {}); return; }
+  pushHistory(userId, 'assistant', reply);
+
+  const chunks = reply.length > 2000 ? reply.match(/[\s\S]{1,2000}/g) : [reply];
+  for (const chunk of chunks) await message.reply(chunk).catch(() => {});
+}
+
+// ============================================================
+// Bot events
+// ============================================================
+client.once('clientReady', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  await registerSlashCommands(client.application.id);
+  for (const guild of client.guilds.cache.values()) {
+    const inviter = await fetchInviter(guild);
+    if (inviter) {
+      guildInviters.set(guild.id, inviter.displayName ?? inviter.username);
+      console.log(`📋 ${guild.name}: added by ${inviter.username}`);
+    }
+  }
+});
+
+client.on('guildCreate', async (guild) => {
+  const inviter = await fetchInviter(guild);
+  if (inviter) {
+    guildInviters.set(guild.id, inviter.displayName ?? inviter.username);
+    console.log(`📋 Joined ${guild.name}: added by ${inviter.username}`);
+  }
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+
+  const userId  = message.author.id;
+  const isDM    = message.channel.type === ChannelType.DM;
+  const isOwner = userId === OWNER_ID;
+
+  // ---- DM handling ----
+  if (isDM) {
+    // Ignore all DMs except owner's
+    if (!isOwner) return;
+
+    if (isOnCooldown(userId)) return;
+    setCooldown(userId);
+
+    const userPrompt  = message.content.trim();
+    const promptLower = userPrompt.toLowerCase();
+    const commandText = promptLower.replace(/^Kevin\s*/i, '').trim();
+
+    const wasCommand = await handleTextCommand(message, commandText, userPrompt, true);
+    if (wasCommand) return;
+
+    if (!userPrompt) return;
+    try {
+      await sendAIReply(message, userPrompt, true);
+    } catch (err) {
+      console.error('DM error:', err);
+      await message.reply("something broke, try again.").catch(() => {});
+    }
+    return;
+  }
+
+  // ---- Server handling ----
+  // In private mode, ignore all server messages
+  if (privateMode) return;
+
+  const wasMentioned = message.mentions.has(client.user);
+  const containsKevin  = /\bKevin\b/i.test(message.content);
+  if (!wasMentioned && !containsKevin) return;
+
+  // Ignore muted users silently
+  if (mutedUsers.has(userId)) return;
+
+  if (isOnCooldown(userId)) return;
+  setCooldown(userId);
+
+  let userPrompt = message.content;
+  if (wasMentioned) userPrompt = userPrompt.replace(`<@${client.user.id}>`, '').trim();
+
+  const promptLower = userPrompt.toLowerCase();
+  const commandText = promptLower.replace(/^Kevin\s*/i, '').trim();
+
+  const wasCommand = await handleTextCommand(message, commandText, userPrompt, false);
+  if (wasCommand) return;
+
+  if (!userPrompt) { await message.reply('yeah? 👀').catch(() => {}); return; }
+
+  try {
+    await sendAIReply(message, userPrompt, false);
+  } catch (err) {
+    console.error('Server message error:', err);
+    await message.reply("something broke, try again in a bit.").catch(() => {});
+  }
+});
+
+// --- Keep alive ---
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+process.on('uncaughtException',  (err) => console.error('Uncaught exception:', err));
+
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  if (err.message?.includes('disallowed intents'))
+    console.error('❌ Enable Message Content Intent in Discord Developer Portal.');
+  else
+    console.error('❌ Login failed:', err.message);
+  process.exit(1);
+});
+// ============================================================
+// EXTRA FEATURES
+// ============================================================
+
+require("./translate")(client);
+require("./time")(client);
